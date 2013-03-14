@@ -1000,7 +1000,7 @@ abstract class AbstractPlatform
     /**
      * Get the sql snippet to append to any SELECT statement which locks rows in shared read lock.
      *
-     * This defaults to the ASNI SQL "FOR UPDATE", which is an exclusive lock (Write). Some database
+     * This defaults to the ANSI SQL "FOR UPDATE", which is an exclusive lock (Write). Some database
      * vendors allow to lighten this constraint up to be a real read lock.
      *
      * @return string
@@ -1013,7 +1013,7 @@ abstract class AbstractPlatform
     /**
      * Get the SQL snippet to append to any SELECT statement which obtains an exclusive lock on the rows.
      *
-     * The semantics of this lock mode should equal the SELECT .. FOR UPDATE of the ASNI SQL standard.
+     * The semantics of this lock mode should equal the SELECT .. FOR UPDATE of the ANSI SQL standard.
      *
      * @return string
      */
@@ -1193,26 +1193,14 @@ abstract class AbstractPlatform
                 }
             }
 
-            $columnData = array();
+            $columnData = $column->toArray();
             $columnData['name'] = $column->getQuotedName($this);
-            $columnData['type'] = $column->getType();
-            $columnData['length'] = $column->getLength();
-            $columnData['notnull'] = $column->getNotNull();
-            $columnData['fixed'] = $column->getFixed();
-            $columnData['unique'] = false; // TODO: what do we do about this?
             $columnData['version'] = $column->hasPlatformOption("version") ? $column->getPlatformOption('version') : false;
+            $columnData['comment'] = $this->getColumnComment($column);
 
             if (strtolower($columnData['type']) == "string" && $columnData['length'] === null) {
                 $columnData['length'] = 255;
             }
-
-            $columnData['unsigned'] = $column->getUnsigned();
-            $columnData['precision'] = $column->getPrecision();
-            $columnData['scale'] = $column->getScale();
-            $columnData['default'] = $column->getDefault();
-            $columnData['columnDefinition'] = $column->getColumnDefinition();
-            $columnData['autoincrement'] = $column->getAutoincrement();
-            $columnData['comment'] = $this->getColumnComment($column);
 
             if (in_array($column->getName(), $options['primary'])) {
                 $columnData['primary'] = true;
@@ -1833,6 +1821,10 @@ abstract class AbstractPlatform
                     $default = " DEFAULT ".$field['default'];
                 } else if ((string)$field['type'] == 'DateTime' && $field['default'] == $this->getCurrentTimestampSQL()) {
                     $default = " DEFAULT ".$this->getCurrentTimestampSQL();
+                } else if ((string)$field['type'] == 'Time' && $field['default'] == $this->getCurrentTimeSQL()) {
+                    $default = " DEFAULT ".$this->getCurrentTimeSQL();
+                } else if ((string)$field['type'] == 'Date' && $field['default'] == $this->getCurrentDateSQL()) {
+                    $default = " DEFAULT ".$this->getCurrentDateSQL();
                 } else if ((string) $field['type'] == 'Boolean') {
                     $default = " DEFAULT '" . $this->convertBooleans($field['default']) . "'";
                 }
@@ -1901,17 +1893,11 @@ abstract class AbstractPlatform
      */
     public function getIndexDeclarationSQL($name, Index $index)
     {
-        $type = '';
-
-        if ($index->isUnique()) {
-            $type = 'UNIQUE ';
-        }
-
         if (count($index->getColumns()) === 0) {
             throw new \InvalidArgumentException("Incomplete definition. 'columns' required.");
         }
 
-        return $type . 'INDEX ' . $name . ' ('
+        return $this->getCreateIndexSQLFlags($index) . 'INDEX ' . $name . ' ('
              . $this->getIndexFieldDeclarationListSQL($index->getColumns())
              . ')';
     }
@@ -1984,16 +1970,6 @@ abstract class AbstractPlatform
     public function getTemporaryTableName($tableName)
     {
         return $tableName;
-    }
-
-    /**
-     * Get sql query to show a list of database.
-     *
-     * @return string
-     */
-    public function getShowDatabasesSQL()
-    {
-        throw DBALException::notSupported(__METHOD__);
     }
 
     /**
@@ -2583,6 +2559,16 @@ abstract class AbstractPlatform
      * @return boolean
      */
     public function supportsCommentOnStatement()
+    {
+        return false;
+    }
+
+    /**
+     * Does this platform have native guid type.
+     *
+     * @return boolean
+     */
+    public function hasNativeGuidType()
     {
         return false;
     }

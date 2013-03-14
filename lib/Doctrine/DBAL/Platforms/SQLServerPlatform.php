@@ -20,6 +20,7 @@
 
 namespace Doctrine\DBAL\Platforms;
 
+use Doctrine\DBAL\LockMode;
 use Doctrine\DBAL\Schema\TableDiff;
 use Doctrine\DBAL\DBALException;
 use Doctrine\DBAL\Schema\ForeignKeyConstraint;
@@ -34,6 +35,7 @@ use Doctrine\DBAL\Schema\Table;
  * @author Roman Borschel <roman@code-factory.org>
  * @author Jonathan H. Wage <jonwage@gmail.com>
  * @author Benjamin Eberlei <kontakt@beberlei.de>
+ * @author Steve Müller <st.mueller@dzh-online.de>
  */
 class SQLServerPlatform extends AbstractPlatform
 {
@@ -80,8 +82,8 @@ class SQLServerPlatform extends AbstractPlatform
     /**
      * {@inheritDoc}
      *
-     * MsSql prefers "autoincrement" identity columns since sequences can only
-     * be emulated with a table.
+     * Microsoft SQL Server prefers "autoincrement" identity columns
+     * since sequences can only be emulated with a table.
      */
     public function prefersIdentityColumns()
     {
@@ -91,7 +93,7 @@ class SQLServerPlatform extends AbstractPlatform
     /**
      * {@inheritDoc}
      *
-     * MsSql supports this through AUTO_INCREMENT columns.
+     * Microsoft SQL Server supports this through AUTO_INCREMENT columns.
      */
     public function supportsIdentityColumns()
     {
@@ -104,6 +106,22 @@ class SQLServerPlatform extends AbstractPlatform
     public function supportsReleaseSavepoints()
     {
         return false;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function supportsSchemas()
+    {
+        return true;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public function hasNativeGuidType()
+    {
+        return true;
     }
 
     /**
@@ -380,14 +398,6 @@ class SQLServerPlatform extends AbstractPlatform
     /**
      * {@inheritDoc}
      */
-    public function getShowDatabasesSQL()
-    {
-        return 'SHOW DATABASES';
-    }
-
-    /**
-     * {@inheritDoc}
-     */
     public function getListTablesSQL()
     {
         // "sysdiagrams" table must be ignored as it's internal SQL Server table for Database Diagrams
@@ -399,7 +409,25 @@ class SQLServerPlatform extends AbstractPlatform
      */
     public function getListTableColumnsSQL($table, $database = null)
     {
-        return "exec sp_columns @table_name = '" . $table . "'";
+        return "SELECT    col.name,
+                          type.name AS type,
+                          col.max_length AS length,
+                          ~col.is_nullable AS notnull,
+                          def.definition AS [default],
+                          col.scale,
+                          col.precision,
+                          col.is_identity AS autoincrement,
+                          col.collation_name AS collation
+                FROM      sys.columns AS col
+                JOIN      sys.types AS type
+                ON        col.user_type_id = type.user_type_id
+                JOIN      sys.objects AS obj
+                ON        col.object_id = obj.object_id
+                LEFT JOIN sys.default_constraints def
+                ON        col.default_object_id = def.object_id
+                AND       col.object_id = def.parent_object_id
+                WHERE     obj.type = 'U'
+                AND       obj.name = '$table'";
     }
 
     /**
@@ -458,17 +486,9 @@ class SQLServerPlatform extends AbstractPlatform
     /**
      * {@inheritDoc}
      */
-    public function getRegexpExpression()
-    {
-        return 'RLIKE';
-    }
-
-    /**
-     * {@inheritDoc}
-     */
     public function getGuidExpression()
     {
-        return 'UUID()';
+        return 'NEWID()';
     }
 
     /**
@@ -668,32 +688,58 @@ class SQLServerPlatform extends AbstractPlatform
 
     /**
      * {@inheritDoc}
-     *
-     * @link http://lists.bestpractical.com/pipermail/rt-devel/2005-June/007339.html
      */
     protected function doModifyLimitQuery($query, $limit, $offset = null)
     {
         if ($limit > 0) {
-            if ($offset == 0) {
-                $query = preg_replace('/^(SELECT\s(DISTINCT\s)?)/i', '\1TOP ' . $limit . ' ', $query);
-            } else {
-                $orderby = stristr($query, 'ORDER BY');
+            $orderby = stristr($query, 'ORDER BY');
+            //Remove ORDER BY from $query
+            $query = preg_replace('/\s+ORDER\s+BY\s+([^\)]*)/', '', $query);
+            $over = 'ORDER BY';
 
-                if ( ! $orderby) {
-                    $over = 'ORDER BY (SELECT 0)';
-                } else {
-                    $over = preg_replace('/\"[^,]*\".\"([^,]*)\"/i', '"inner_tbl"."$1"', $orderby);
+            if ( ! $orderby) {
+                $over .= ' (SELECT 0)';
+            } else {
+                //Clear ORDER BY
+                $orderby = preg_replace('/ORDER\s+BY\s+([^\)]*)(.*)/', '$1', $orderby);
+                $orderbyParts = explode(',', $orderby);
+                $orderbyColumns = array();
+
+                //Split ORDER BY into parts
+                foreach ($orderbyParts as &$part) {
+                    $part = trim($part);
+                    if (preg_match('/(([^\s]*)\.)?([^\.\s]*)\s*(ASC|DESC)?/i', $part, $matches)) {
+                        $orderbyColumns[] = array(
+                            'table' => empty($matches[2]) ? '[^\.\s]*' : $matches[2],
+                            'column' => $matches[3],
+                            'sort' => isset($matches[4]) ? $matches[4] : null
+                        );
+                    }
                 }
 
-                // Remove ORDER BY clause from $query
-                $query = preg_replace('/\s+ORDER BY(.*)/', '', $query);
-                $query = preg_replace('/^SELECT\s/', '', $query);
+                //Find alias for each colum used in ORDER BY
+                if (count($orderbyColumns)) {
+                    foreach ($orderbyColumns as $column) {
+                        if (preg_match('/' . $column['table'] . '\.(' . $column['column'] . ')\s*(AS)?\s*([^,\s\)]*)/i', $query, $matches)) {
+                            $over .= ' ' . $matches[3];
+                            $over .= isset($column['sort']) ? ' ' . $column['sort'] . ',' : ',';
+                        } else {
+                            $over .= ' ' . $column['column'];
+                            $over .= isset($column['sort']) ? ' ' . $column['sort'] . ',' : ',';
+                        }
+                    }
 
-                $start = $offset + 1;
-                $end = $offset + $limit;
-
-                $query = "SELECT * FROM (SELECT ROW_NUMBER() OVER ($over) AS doctrine_rownum, $query) AS doctrine_tbl WHERE doctrine_rownum BETWEEN $start AND $end";
+                    $over = rtrim($over, ',');
+                }
             }
+
+            //Replace only first occurrence of FROM with $over to prevent changing FROM also in subqueries.
+            $query = preg_replace('/\sFROM/i', ", ROW_NUMBER() OVER ($over) AS doctrine_rownum FROM", $query, 1);
+
+            $start = $offset + 1;
+            $end = $offset + $limit;
+
+            $query = "SELECT * FROM ($query) AS doctrine_tbl WHERE doctrine_rownum BETWEEN $start AND $end";
         }
 
         return $query;
@@ -845,16 +891,21 @@ class SQLServerPlatform extends AbstractPlatform
      */
     public function appendLockHint($fromClause, $lockMode)
     {
-        // @todo correct
-        if ($lockMode == \Doctrine\DBAL\LockMode::PESSIMISTIC_READ) {
-            return $fromClause . ' WITH (tablockx)';
+        switch ($lockMode) {
+            case LockMode::NONE:
+                $lockClause = ' WITH (NOLOCK)';
+                break;
+            case LockMode::PESSIMISTIC_READ:
+                $lockClause = ' WITH (HOLDLOCK, ROWLOCK)';
+                break;
+            case LockMode::PESSIMISTIC_WRITE:
+                $lockClause = ' WITH (UPDLOCK, ROWLOCK)';
+                break;
+            default:
+                $lockClause = '';
         }
 
-        if ($lockMode == \Doctrine\DBAL\LockMode::PESSIMISTIC_WRITE) {
-            return $fromClause . ' WITH (tablockx)';
-        }
-
-        return $fromClause;
+        return $fromClause . $lockClause;
     }
 
     /**
@@ -870,7 +921,7 @@ class SQLServerPlatform extends AbstractPlatform
      */
     protected function getReservedKeywordsClass()
     {
-        return 'Doctrine\DBAL\Platforms\Keywords\MsSQLKeywords';
+        return 'Doctrine\DBAL\Platforms\Keywords\SQLServerKeywords';
     }
 
     /**
@@ -923,5 +974,43 @@ class SQLServerPlatform extends AbstractPlatform
         }
 
         return " DEFAULT '" . $field['default'] . "'";
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getColumnCollationDeclarationSQL($collation)
+    {
+        return 'COLLATE ' . $collation;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * Modifies column declaration order as it differs in Microsoft SQL Server.
+     */
+    public function getColumnDeclarationSQL($name, array $field)
+    {
+        if (isset($field['columnDefinition'])) {
+            $columnDef = $this->getCustomTypeDeclarationSQL($field);
+        } else {
+            $default = $this->getDefaultValueDeclarationSQL($field);
+
+            $collation = (isset($field['collate']) && $field['collate']) ?
+                ' ' . $this->getColumnCollationDeclarationSQL($field['collate']) : '';
+
+            $notnull = (isset($field['notnull']) && $field['notnull']) ? ' NOT NULL' : '';
+
+            $unique = (isset($field['unique']) && $field['unique']) ?
+                ' ' . $this->getUniqueFieldDeclarationSQL() : '';
+
+            $check = (isset($field['check']) && $field['check']) ?
+                ' ' . $field['check'] : '';
+
+            $typeDecl = $field['type']->getSqlDeclaration($field, $this);
+            $columnDef = $typeDecl . $collation . $default . $notnull . $unique . $check;
+        }
+
+        return $name . ' ' . $columnDef;
     }
 }
